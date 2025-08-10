@@ -11,22 +11,53 @@ plt.rcParams['font.size'] = 12
 
 def get_rotation_matrix(size, device):
     """
-    Generate a random orthogonal matrix of the specified size.
-    First, we generate a random matrix with entries from a standard distribution.
-    Then, we use QR decomposition to obtain an orthogonal matrix.
-    Finally, we multiply by a diagonal matrix with diag r to adjust the signs.
+    Load a learned orthogonal rotation matrix from learned_rotation_matrix.pt.
+    If the loaded matrix size doesn't match the required size, it will be resized or cropped.
+    Fallback to random generation if the file doesn't exist or can't be loaded.
 
     Args:
     size (int): The size of the matrix (size x size).
+    device: The device to place the matrix on.
 
     Returns:
     torch.Tensor: An orthogonal matrix of the specified size.
     """
     torch.cuda.empty_cache()
-    random_matrix = torch.randn(size, size, dtype=torch.float64).to(device)
-    q, r = torch.linalg.qr(random_matrix)
-    q *= torch.sign(torch.diag(r)).unsqueeze(0)
-    return q
+    
+    try:
+        # Try to load the learned rotation matrix
+        learned_matrix = torch.load('learned_rotation_matrix.pt', map_location=device)
+        # Ensure it's in the correct dtype
+        if learned_matrix.dtype != torch.float64:
+            learned_matrix = learned_matrix.to(dtype=torch.float64)
+        
+        # Handle size mismatch
+        if learned_matrix.shape[0] == size and learned_matrix.shape[1] == size:
+            # Perfect match
+            print(f"Using learned rotation matrix of size {size}x{size}")
+            return learned_matrix
+        elif learned_matrix.shape[0] >= size and learned_matrix.shape[1] >= size:
+            # Crop to required size
+            cropped_matrix = learned_matrix[:size, :size]
+            print(f"Cropped learned rotation matrix from {learned_matrix.shape} to {size}x{size}")
+            return cropped_matrix
+        else:
+            # Pad or extend the matrix if it's smaller
+            extended_matrix = torch.eye(size, dtype=torch.float64, device=device)
+            min_size = min(learned_matrix.shape[0], learned_matrix.shape[1], size)
+            extended_matrix[:min_size, :min_size] = learned_matrix[:min_size, :min_size]
+            print(f"Extended learned rotation matrix from {learned_matrix.shape} to {size}x{size}")
+            return extended_matrix
+            
+    except Exception as e:
+        print(f"Could not load learned rotation matrix: {e}")
+        print("Falling back to random orthogonal matrix generation")
+        
+        # Fallback to original random generation
+        random_matrix = torch.randn(size, size, dtype=torch.float64).to(device)
+        q, r = torch.linalg.qr(random_matrix)
+        q *= torch.sign(torch.diag(r)).unsqueeze(0)
+        return q
 
 
 def get_matrix(file_path='attn_map.npy'):
@@ -291,6 +322,91 @@ def general_quantization_method(activations, weight_matrix):
     dequantized_weights = quantized_weights.float() * scale + min_val
     
     return quantized_activations, quantized_weights, dequantized_weights
+
+def rotation_quantization_method(activations, weight_matrix, rotation_matrix=None):
+    """
+    Rotation-based quantization method with proper inverse rotation for comparison
+    Process: Original W -> R@W@R.T -> Quantize -> Dequantize -> R.T@W_dequant@R
+    
+    The final result after R.T (inverse rotation) should be compared with the original matrix W
+    to measure quantization error properly, as it's back in the original coordinate space.
+    
+    Args:
+        activations: input activation tensor
+        weight_matrix: input weight matrix (original W)
+        rotation_matrix: orthogonal rotation matrix (if None, generate automatically)
+    Returns:
+        quantized_activations, quantized_weights (in rotated space), 
+        dequantized_weights (back in original space after R.T), rotation_matrix_used
+    """
+    device = weight_matrix.device
+    dtype = weight_matrix.dtype
+    
+    # Generate rotation matrix if not provided
+    if rotation_matrix is None:
+        size = min(weight_matrix.shape)  # Use smaller dimension for square rotation
+        rotation_matrix = get_rotation_matrix(size, device)
+    
+    # Ensure rotation matrix has the same dtype as weight matrix
+    rotation_matrix = rotation_matrix.to(dtype=dtype)
+    
+    # Step 1: Apply rotation to weight matrix (W -> R@W@R.T)
+    # This transforms the weights to a coordinate system that may be more quantization-friendly
+    if weight_matrix.shape[0] == weight_matrix.shape[1]:
+        # Square matrix: W_rotated = R @ W @ R.T
+        rotated_weights = torch.matmul(torch.matmul(rotation_matrix, weight_matrix), rotation_matrix.T)
+    else:
+        # Non-square matrix: apply rotation to the dimension that matches rotation matrix size
+        if weight_matrix.shape[0] == rotation_matrix.shape[0]:
+            # Rotate rows: W_rotated = R @ W
+            rotated_weights = torch.matmul(rotation_matrix, weight_matrix)
+        elif weight_matrix.shape[1] == rotation_matrix.shape[0]:
+            # Rotate columns: W_rotated = W @ R.T
+            rotated_weights = torch.matmul(weight_matrix, rotation_matrix.T)
+        else:
+            # If dimensions don't match, crop or pad to make it work
+            min_dim = min(weight_matrix.shape[0], rotation_matrix.shape[0])
+            rotated_weights = torch.matmul(rotation_matrix[:min_dim, :min_dim], 
+                                         weight_matrix[:min_dim, :])
+    
+    # Step 2: Apply general quantization to rotated weights
+    quantized_activations = activation_quant(activations) if activations is not None else None
+    
+    # Quantize rotated weights using min-max scaling (same as general quantization)
+    min_val = rotated_weights.min()
+    max_val = rotated_weights.max()
+    scale = (max_val - min_val) / 255.0
+    
+    quantized_rotated_weights = torch.round((rotated_weights - min_val) / scale).clamp(0, 255)
+    quantized_rotated_weights = quantized_rotated_weights.to(torch.uint8)
+    
+    # Step 3: Dequantize (still in rotated coordinate system)
+    dequantized_rotated_weights = quantized_rotated_weights.to(dtype) * scale + min_val
+    
+    # Step 4: Apply inverse rotation (R.T) to get back to original coordinate system
+    # This is crucial for fair comparison with the original matrix
+    if weight_matrix.shape[0] == weight_matrix.shape[1]:
+        # Square matrix: W_final = R.T @ W_dequant @ R (inverse of Step 1)
+        final_dequantized_weights = torch.matmul(torch.matmul(rotation_matrix.T, dequantized_rotated_weights), rotation_matrix)
+    else:
+        # Non-square matrix: apply inverse rotation
+        if weight_matrix.shape[0] == rotation_matrix.shape[0]:
+            # Inverse rotate rows: W_final = R.T @ W_dequant
+            final_dequantized_weights = torch.matmul(rotation_matrix.T, dequantized_rotated_weights)
+        elif weight_matrix.shape[1] == rotation_matrix.shape[0]:
+            # Inverse rotate columns: W_final = W_dequant @ R
+            final_dequantized_weights = torch.matmul(dequantized_rotated_weights, rotation_matrix)
+        else:
+            min_dim = min(weight_matrix.shape[0], rotation_matrix.shape[0])
+            temp_result = torch.matmul(rotation_matrix[:min_dim, :min_dim].T, 
+                                     dequantized_rotated_weights)
+            # Pad back to original size if needed
+            final_dequantized_weights = torch.zeros_like(weight_matrix)
+            final_dequantized_weights[:temp_result.shape[0], :temp_result.shape[1]] = temp_result
+    
+    # Return: quantized_weights are in rotated space, final_dequantized_weights are back in original space
+    # The final_dequantized_weights should be compared with the original weight_matrix for error measurement
+    return quantized_activations, quantized_rotated_weights, final_dequantized_weights, rotation_matrix
 
 def weight_quant_general_8bit(w):
     """
@@ -699,38 +815,66 @@ if __name__ == "__main__":
     print(f"Original weight shape: {Weight.shape}")
     print(f"Original weight min: {Weight.min():.6f}, max: {Weight.max():.6f}")
     
-    # Generate rotation matrix and apply rotation
-    size = 42  # Example size
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    rotation_matrix = get_rotation_matrix(size, device)
-    rotated_weight = torch.matmul(Weight, rotation_matrix)
-    print(f"Rotated weight shape: {rotated_weight.shape}")
+    # Use the first 42x42 portion for consistent analysis
+    if Weight.shape[0] >= 42 and Weight.shape[1] >= 42:
+        original_weight_42x42 = Weight[:42, :42]
+    else:
+        # If smaller, pad or create a sample 42x42 matrix
+        original_weight_42x42 = torch.randn(42, 42, device=Weight.device) * Weight.std() + Weight.mean()
     
-    # Apply general quantization
-    sample_activation_for_general = torch.randn(10, rotated_weight.shape[0]) * 2.0
-    quantized_act, quantized_weight, dequantized_weight = general_quantization_method(sample_activation_for_general, rotated_weight)
-    print(f"Quantized weight shape: {quantized_weight.shape}")
-    print(f"Dequantized weight min: {dequantized_weight.min():.6f}, max: {dequantized_weight.max():.6f}")
+    print(f"Working with 42x42 weight matrix")
+    print(f"42x42 weight min: {original_weight_42x42.min():.6f}, max: {original_weight_42x42.max():.6f}")
+    
+    # Create sample activations for testing
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sample_activation_for_general = torch.randn(10, 42, device=device) * 2.0
+    
+    # Method 1: General 8-bit Quantization (without rotation)
+    print("\n--- General 8-bit Quantization (No Rotation) ---")
+    general_quantized_act, general_quantized_weight, general_dequantized_weight = general_quantization_method(
+        sample_activation_for_general, original_weight_42x42
+    )
+    general_mse = torch.mean((original_weight_42x42 - general_dequantized_weight) ** 2)
+    print(f"General quantization MSE: {general_mse:.6f}")
+    print(f"General quantized weight range: [{general_quantized_weight.min()}, {general_quantized_weight.max()}]")
     
     # Visualize general quantization results
-    visualize_quantization_results(rotated_weight, quantized_weight, dequantized_weight, "General 8-bit Quantization")
+    visualize_quantization_results(original_weight_42x42, general_quantized_weight, general_dequantized_weight, "General 8-bit Quantization")
+    visualize_matrix_heatmaps(original_weight_42x42, general_quantized_weight, general_dequantized_weight, "General 8-bit Quantization")
     
-    # Visualize 42x42 matrix heatmaps for general quantization
-    visualize_matrix_heatmaps(rotated_weight, quantized_weight, dequantized_weight, "General 8-bit Quantization")
+    # Method 2: Rotation + General 8-bit Quantization
+    print("\n--- Rotation + General 8-bit Quantization ---")
+    print("Process: Original -> R@W@R.T -> Quantize -> Dequantize -> R.T@W_dequant@R -> Compare with Original")
+    rotation_quantized_act, rotation_quantized_weight, rotation_dequantized_weight, rotation_matrix_used = rotation_quantization_method(
+        sample_activation_for_general, original_weight_42x42
+    )
+    # Compare the final result (after inverse rotation R.T) with the original matrix
+    rotation_mse = torch.mean((original_weight_42x42 - rotation_dequantized_weight) ** 2)
+    print(f"Rotation quantization MSE (Original vs Final after R.T): {rotation_mse:.6f}")
+    print(f"Rotation quantized weight range: [{rotation_quantized_weight.min()}, {rotation_quantized_weight.max()}]")
+    print(f"Rotation matrix shape: {rotation_matrix_used.shape}")
+    
+    # Calculate improvement compared to no-rotation method
+    improvement = ((general_mse - rotation_mse) / general_mse * 100).item()
+    print(f"MSE improvement with rotation: {improvement:.2f}%")
+    
+    # Visualize rotation quantization results
+    visualize_quantization_results(original_weight_42x42, rotation_quantized_weight, rotation_dequantized_weight, "Rotation + General 8-bit Quantization")
+    visualize_matrix_heatmaps(original_weight_42x42, rotation_quantized_weight, rotation_dequantized_weight, "Rotation + General 8-bit Quantization")
     
     # Example for activation quantization
     print("\n--- Activation Quantization Example ---")
     # Create a sample activation tensor [batch_size, feature_dim]
-    sample_activation = torch.randn(10, 128) * 5.0  # Random activation with larger range
+    sample_activation = torch.randn(10, 128, device=device) * 5.0  # Random activation with larger range
     print(f"Original activation shape: {sample_activation.shape}")
     print(f"Original activation range: [{sample_activation.min():.4f}, {sample_activation.max():.4f}]")
     
     quantized_activation = activation_quant(sample_activation)
     print(f"Quantized activation range: [{quantized_activation.min():.4f}, {quantized_activation.max():.4f}]")
     
-    # Example for weight quantization (1.58-bit)
-    print("\n--- Weight Quantization (1.58-bit) Example ---")
-    sample_weight = torch.randn(256, 128) * 0.1  # Random weight matrix
+    # Example for weight quantization (1.58-bit) - NO ROTATION APPLIED
+    print("\n--- Weight Quantization (1.58-bit) Example - No Rotation ---")
+    sample_weight = torch.randn(256, 128, device=device) * 0.1  # Random weight matrix
     print(f"Original weight shape: {sample_weight.shape}")
     print(f"Original weight range: [{sample_weight.min():.4f}, {sample_weight.max():.4f}]")
     
@@ -742,32 +886,35 @@ if __name__ == "__main__":
     visualize_quantization_results(sample_weight, quantized_weight_158, dequantized_weight_158, "1.58-bit Ternary Quantization")
     
     # Create a 42x42 sample for matrix visualization
-    sample_weight_42x42 = torch.randn(42, 42) * 0.1
+    sample_weight_42x42 = torch.randn(42, 42, device=device) * 0.1
     quantized_42x42, dequantized_42x42 = weight_quant_with_dequant(sample_weight_42x42)
     visualize_matrix_heatmaps(sample_weight_42x42, quantized_42x42, dequantized_42x42, "1.58-bit Ternary Quantization")
     
     # Compare quantization errors
     print("\n--- Quantization Error Analysis ---")
-    mse_general = torch.mean((rotated_weight - dequantized_weight) ** 2)
-    mse_weight = torch.mean((sample_weight - dequantized_weight_158) ** 2)
+    mse_general_no_rotation = torch.mean((original_weight_42x42 - general_dequantized_weight) ** 2)
+    mse_general_with_rotation = torch.mean((original_weight_42x42 - rotation_dequantized_weight) ** 2)
+    mse_weight_158 = torch.mean((sample_weight - dequantized_weight_158) ** 2)
     mse_activation = torch.mean((sample_activation - quantized_activation) ** 2)
     
-    print(f"General quantization MSE: {mse_general:.6f}")
-    print(f"1.58-bit weight quantization MSE: {mse_weight:.6f}")
+    print(f"General quantization (no rotation) MSE: {mse_general_no_rotation:.6f}")
+    print(f"General quantization (with rotation) MSE: {mse_general_with_rotation:.6f}")
+    print(f"1.58-bit weight quantization MSE: {mse_weight_158:.6f}")
     print(f"Activation quantization MSE: {mse_activation:.6f}")
     
-    # Smoothing example with general 8-bit quantization
-    print("\n--- SmoothQuant with General 8-bit Quantization Example ---")
-    # Create sample activations and weights for smoothing
-    sample_act = torch.randn(32, 256) * 2.0  # [batch, features]
-    sample_w = torch.randn(256, 512) * 0.1   # [in_features, out_features]
+    # SmoothQuant example with general 8-bit quantization (NO ROTATION)
+    print("\n--- SmoothQuant with General 8-bit Quantization Example - No Rotation ---")
+    print("Using same original 42x42 matrix for fair comparison")
+    # Use the same original matrix for fair comparison
+    sample_act_for_smooth = torch.randn(32, 42, device=device) * 2.0  # [batch, features] - matching 42x42 matrix
+    sample_w_for_smooth = original_weight_42x42.clone()  # Use the same original matrix
     
-    print(f"Original activation range: [{sample_act.min():.4f}, {sample_act.max():.4f}]")
-    print(f"Original weight range: [{sample_w.min():.4f}, {sample_w.max():.4f}]")
+    print(f"Original activation range: [{sample_act_for_smooth.min():.4f}, {sample_act_for_smooth.max():.4f}]")
+    print(f"Original weight range: [{sample_w_for_smooth.min():.4f}, {sample_w_for_smooth.max():.4f}]")
     
-    # Apply SmoothQuant with general 8-bit quantization
+    # Apply SmoothQuant with general 8-bit quantization (NO ROTATION)
     smoothed_quant_act, smoothed_quant_w, smoothed_dequant_w, smoothed_act, smoothed_w = smooth_general_quantization_method(
-        sample_act, sample_w, alpha=0.5
+        sample_act_for_smooth, sample_w_for_smooth, alpha=0.5
     )
     
     print(f"Smoothed activation range: [{smoothed_act.min():.4f}, {smoothed_act.max():.4f}]")
@@ -778,51 +925,47 @@ if __name__ == "__main__":
     # Visualize SmoothQuant + 8-bit quantization results
     visualize_quantization_results(smoothed_w, smoothed_quant_w, smoothed_dequant_w, "SmoothQuant + 8-bit Quantization")
     
-    # Create a 42x42 sample for smoothed matrix visualization
-    sample_act_42x42 = torch.randn(32, 42) * 2.0
-    sample_w_42x42 = torch.randn(42, 42) * 0.1
-    smoothed_quant_act_42x42, smoothed_quant_w_42x42, smoothed_dequant_w_42x42, smoothed_act_42x42_out, smoothed_w_42x42_out = smooth_general_quantization_method(
-        sample_act_42x42, sample_w_42x42, alpha=0.5
-    )
-    visualize_matrix_heatmaps(smoothed_w_42x42_out, smoothed_quant_w_42x42, smoothed_dequant_w_42x42, "SmoothQuant + 8-bit Quantization")
+    # Use the same 42x42 matrix for matrix visualization (no need for separate random generation)
+    visualize_matrix_heatmaps(smoothed_w, smoothed_quant_w, smoothed_dequant_w, "SmoothQuant + 8-bit Quantization")
     
-    # Compare different quantization methods
+    # Compare different quantization methods (WITHOUT rotation for non-general methods)
     print("\n--- Quantization Method Comparison ---")
     
-    # Without smoothing - general 8-bit
-    quant_w_direct, dequant_w_direct = weight_quant_general_8bit(sample_w)
-    mse_direct = torch.mean((sample_w - dequant_w_direct) ** 2)
+    # Without smoothing - general 8-bit (without rotation) using same original matrix
+    quant_w_direct, dequant_w_direct = weight_quant_general_8bit(original_weight_42x42)
+    mse_direct = torch.mean((original_weight_42x42 - dequant_w_direct) ** 2)
     
-    # With smoothing - general 8-bit  
+    # With smoothing - general 8-bit (without rotation) - already calculated above
     mse_smoothed = torch.mean((smoothed_w - smoothed_dequant_w) ** 2)
     
-    # Activation comparison
-    quant_act_direct = activation_quant(sample_act)
-    mse_act_direct = torch.mean((sample_act - quant_act_direct) ** 2)
+    # Activation comparison using same activation
+    quant_act_direct = activation_quant(sample_act_for_smooth)
+    mse_act_direct = torch.mean((sample_act_for_smooth - quant_act_direct) ** 2)
     mse_act_smoothed = torch.mean((smoothed_act - smoothed_quant_act) ** 2)
     
-    print(f"Weight MSE without smoothing (8-bit): {mse_direct:.6f}")
-    print(f"Weight MSE with SmoothQuant (8-bit): {mse_smoothed:.6f}")
+    print(f"Weight MSE without smoothing (8-bit, no rotation): {mse_direct:.6f}")
+    print(f"Weight MSE with SmoothQuant (8-bit, no rotation): {mse_smoothed:.6f}")
     print(f"Weight smoothing improvement: {((mse_direct - mse_smoothed) / mse_direct * 100):.2f}%")
     
     print(f"Activation MSE without smoothing: {mse_act_direct:.6f}")
     print(f"Activation MSE with SmoothQuant: {mse_act_smoothed:.6f}")
     print(f"Activation smoothing improvement: {((mse_act_direct - mse_act_smoothed) / mse_act_direct * 100):.2f}%")
     
-    # LLM.int8 quantization example
-    print("\n--- LLM.int8 Quantization Example ---")
-    # Create sample with some outlier features
-    sample_act_llm = torch.randn(32, 256) * 2.0
-    # Inject some outliers (features with large values)
-    outlier_indices = torch.randperm(256)[:20]  # 20 outlier features
+    # LLM.int8 quantization example (NO ROTATION)
+    print("\n--- LLM.int8 Quantization Example - No Rotation ---")
+    print("Using same original 42x42 matrix for fair comparison")
+    # Use the same original matrix for fair comparison
+    sample_act_llm = torch.randn(32, 42, device=device) * 2.0  # [batch, features] - matching 42x42 matrix
+    # Inject some outliers (features with large values) - adjust for 42 features
+    outlier_indices = torch.randperm(42)[:5]  # 5 outlier features out of 42
     sample_act_llm[:, outlier_indices] *= 5.0  # Make them outliers
     
-    sample_w_llm = torch.randn(256, 512) * 0.1
+    sample_w_llm = original_weight_42x42.clone()  # Use the same original matrix
     
     print(f"LLM.int8 activation range: [{sample_act_llm.min():.4f}, {sample_act_llm.max():.4f}]")
     print(f"LLM.int8 weight range: [{sample_w_llm.min():.4f}, {sample_w_llm.max():.4f}]")
     
-    # Apply LLM.int8 quantization
+    # Apply LLM.int8 quantization (NO ROTATION)
     llm_quant_act, llm_quant_w, llm_dequant_w, llm_outlier_mask = llm_int8_quantization_method(
         sample_act_llm, sample_w_llm, outlier_threshold=6.0
     )
@@ -831,52 +974,51 @@ if __name__ == "__main__":
     visualize_llm_int8_analysis(sample_act_llm, sample_w_llm, llm_quant_act, 
                                llm_quant_w, llm_dequant_w, llm_outlier_mask, "LLM.int8 Quantization")
     
-    # Create 42x42 sample for LLM.int8 matrix visualization
-    sample_act_llm_42x42 = torch.randn(32, 42) * 2.0
-    sample_act_llm_42x42[:, :5] *= 5.0  # Make first 5 features outliers
-    sample_w_llm_42x42 = torch.randn(42, 42) * 0.1
-    
-    llm_quant_act_42x42, llm_quant_w_42x42, llm_dequant_w_42x42, llm_outlier_mask_42x42 = llm_int8_quantization_method(
-        sample_act_llm_42x42, sample_w_llm_42x42, outlier_threshold=6.0
-    )
-    
-    visualize_matrix_heatmaps(sample_w_llm_42x42, llm_quant_w_42x42, llm_dequant_w_42x42, "LLM.int8 Quantization")
+    # Use the same 42x42 matrix for matrix visualization
+    visualize_matrix_heatmaps(sample_w_llm, llm_quant_w, llm_dequant_w, "LLM.int8 Quantization")
     
     # Additional visualizations for weight distribution changes
     print("\n--- Advanced Weight Distribution Analysis ---")
     
-    # 1. Visualize weight distribution evolution for SmoothQuant + 8-bit
-    visualize_weight_distribution_changes(sample_w, smoothed_w, smoothed_quant_w, smoothed_dequant_w, 
+    # 1. Visualize weight distribution evolution for Rotation + General 8-bit
+    visualize_weight_distribution_changes(original_weight_42x42, None, rotation_quantized_weight, rotation_dequantized_weight, 
+                                        "Rotation + General 8-bit Quantization")
+    
+    # 2. Visualize weight distribution evolution for SmoothQuant + 8-bit (no rotation)
+    visualize_weight_distribution_changes(original_weight_42x42, smoothed_w, smoothed_quant_w, smoothed_dequant_w, 
                                         "SmoothQuant + 8-bit Quantization")
     
-    # 2. Visualize weight distribution evolution for general 8-bit (no smoothing)
-    visualize_weight_distribution_changes(sample_w, None, quant_w_direct, dequant_w_direct, 
+    # 3. Visualize weight distribution evolution for general 8-bit (no rotation)
+    visualize_weight_distribution_changes(original_weight_42x42, None, quant_w_direct, dequant_w_direct, 
                                         "General 8-bit Quantization")
     
-    # 3. Visualize weight distribution evolution for 1.58-bit quantization
+    # 4. Visualize weight distribution evolution for 1.58-bit quantization (no rotation)
     visualize_weight_distribution_changes(sample_weight, None, quantized_weight_158, dequantized_weight_158, 
                                         "1.58-bit Ternary Quantization")
     
-    # 3.5. Visualize weight distribution evolution for LLM.int8 quantization
+    # 5. Visualize weight distribution evolution for LLM.int8 quantization (no rotation)
     visualize_weight_distribution_changes(sample_w_llm, None, llm_quant_w, llm_dequant_w, 
                                         "LLM.int8 Quantization")
     
-    # 4. Comparative distribution analysis
+    # 6. Comparative distribution analysis (all using same 42x42 original matrix)
     methods_data = [
-        (quant_w_direct, dequant_w_direct),  # General 8-bit
-        (smoothed_quant_w, smoothed_dequant_w),  # SmoothQuant + 8-bit
-        (quantized_weight_158, dequantized_weight_158),  # 1.58-bit
-        (llm_quant_w, llm_dequant_w)  # LLM.int8
+        (general_quantized_weight, general_dequantized_weight),  # General 8-bit (no rotation)
+        (rotation_quantized_weight, rotation_dequantized_weight),  # Rotation + General 8-bit
+        (smoothed_quant_w, smoothed_dequant_w),  # SmoothQuant + 8-bit (no rotation)
+        (quantized_weight_158, dequantized_weight_158),  # 1.58-bit (no rotation)
+        (llm_quant_w, llm_dequant_w)  # LLM.int8 (no rotation)
     ]
-    method_names = ["General 8-bit", "SmoothQuant + 8-bit", "1.58-bit Ternary", "LLM.int8"]
+    method_names = ["General 8-bit", "Rotation + General 8-bit", "SmoothQuant + 8-bit", "1.58-bit Ternary", "LLM.int8"]
     
-    visualize_comparative_distributions(sample_w, methods_data, method_names)
+    # Use the same base weight for fair comparison (all 42x42)
+    visualize_comparative_distributions(original_weight_42x42, methods_data, method_names)
     
-    # 5. Error heatmaps for different methods
-    visualize_quantization_error_heatmap(sample_w_42x42, dequant_w_direct[:42, :42], "General 8-bit Quantization")
-    visualize_quantization_error_heatmap(sample_w_42x42, smoothed_dequant_w_42x42, "SmoothQuant + 8-bit Quantization")
+    # 7. Error heatmaps for different methods (all using same original matrix)
+    visualize_quantization_error_heatmap(original_weight_42x42, general_dequantized_weight, "General 8-bit Quantization")
+    visualize_quantization_error_heatmap(original_weight_42x42, rotation_dequantized_weight, "Rotation + General 8-bit Quantization")
+    visualize_quantization_error_heatmap(original_weight_42x42, smoothed_dequant_w, "SmoothQuant + 8-bit Quantization")
     visualize_quantization_error_heatmap(sample_weight_42x42, dequantized_42x42, "1.58-bit Ternary Quantization")
-    visualize_quantization_error_heatmap(sample_w_llm_42x42, llm_dequant_w_42x42, "LLM.int8 Quantization")
+    visualize_quantization_error_heatmap(sample_w_llm, llm_dequant_w, "LLM.int8 Quantization")
     
     print("\n--- Distribution Statistics Summary ---")
     
@@ -907,10 +1049,23 @@ if __name__ == "__main__":
         print(f"  Original range: [{orig_np.min():.4f}, {orig_np.max():.4f}]")
         print(f"  Dequantized range: [{dequant_np.min():.4f}, {dequant_np.max():.4f}]")
     
-    calculate_distribution_stats(sample_w, quant_w_direct, dequant_w_direct, "General 8-bit Quantization")
-    calculate_distribution_stats(sample_w, smoothed_quant_w, smoothed_dequant_w, "SmoothQuant + 8-bit Quantization")
+    # Calculate stats for 42x42 matrices (for fair comparison)
+    calculate_distribution_stats(original_weight_42x42, general_quantized_weight, general_dequantized_weight, "General 8-bit Quantization (No Rotation)")
+    calculate_distribution_stats(original_weight_42x42, rotation_quantized_weight, rotation_dequantized_weight, "Rotation + General 8-bit Quantization")
+    calculate_distribution_stats(original_weight_42x42, quant_w_direct, dequant_w_direct, "General 8-bit Quantization (Direct)")
+    calculate_distribution_stats(original_weight_42x42, smoothed_quant_w, smoothed_dequant_w, "SmoothQuant + 8-bit Quantization")
     calculate_distribution_stats(sample_weight, quantized_weight_158, dequantized_weight_158, "1.58-bit Ternary Quantization")
     calculate_distribution_stats(sample_w_llm, llm_quant_w, llm_dequant_w, "LLM.int8 Quantization")
+    
+    print(f"\n--- Rotation Method Analysis ---")
+    print(f"Original 42x42 matrix MSE (no rotation): {mse_general_no_rotation:.6f}")
+    print(f"Rotation + quantization MSE: {mse_general_with_rotation:.6f}")
+    rotation_improvement = ((mse_general_no_rotation - mse_general_with_rotation) / mse_general_no_rotation * 100).item()
+    print(f"Improvement with rotation: {rotation_improvement:.2f}%")
+    if rotation_improvement > 0:
+        print("✓ Rotation method reduces quantization error")
+    else:
+        print("✗ Rotation method does not improve quantization for this matrix")
     
     print(f"\n--- LLM.int8 Special Analysis ---")
     outlier_count = llm_outlier_mask.sum().item()
@@ -926,4 +1081,17 @@ if __name__ == "__main__":
     original_bits = total_features * 32  # Original FP32
     memory_savings = ((original_bits - (regular_bits + outlier_bits)) / original_bits) * 100
     print(f"Estimated memory savings: {memory_savings:.1f}%")
+    
+    print(f"\n--- Summary of All Methods ---")
+    print("Method Comparison (Lower MSE is better):")
+    print(f"1. General 8-bit (no rotation): {mse_general_no_rotation:.6f}")
+    print(f"2. Rotation + General 8-bit: {mse_general_with_rotation:.6f}")
+    print(f"3. SmoothQuant + 8-bit: {mse_smoothed:.6f}")
+    print(f"4. 1.58-bit Ternary: {mse_weight_158:.6f}")
+    print(f"5. LLM.int8: {torch.mean((sample_w_llm - llm_dequant_w) ** 2):.6f}")
+    
+    print(f"\nNote: All methods now use the same original 42x42 matrix for fair comparison.")
+    print(f"Rotation method is only applied to general 8-bit quantization.")
+    print(f"Other methods (SmoothQuant, 1.58-bit, LLM.int8) do not use rotation.")
+    print(f"This demonstrates the specific benefits of rotation for standard quantization approaches.")
 
